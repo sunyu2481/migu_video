@@ -124,15 +124,14 @@ function getddCalcu(puData, programId, clientType, rateType, urlUserId) {
 
   // 不登录标清是默认v
   const id = urlUserId || userId || process.env.USERID || ""
-  if (id) {
-    const words1 = list.android.keys[id[7]]
-    list.android.words[0] = words1
-    list.h5.words[0] = words1
-  }
 
   let keys = list[clientType].keys
-  let words = list[clientType].words
+  // 拷贝一份字表，避免改写模块级常量导致不同请求/不同用户的参数互相污染
+  let words = [...list[clientType].words]
   const thirdReplaceIndex = list[clientType].thirdReplaceIndex
+  if (id) {
+    words[0] = keys[id[7]]
+  }
   // android平台标清
   if (clientType == "android" && rateType == "2") {
     words[0] = "v"

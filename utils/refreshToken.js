@@ -1,5 +1,5 @@
 import { AESencrypt, getStringMD5, RSAencrypt } from "./EncryUtils.js"
-import { fetchUrl } from "./net.js";
+import { fetchUrl, RateLimitError } from "./net.js";
 
 /**
  * @param {string} str - 
@@ -40,7 +40,7 @@ async function refreshToken(userId, token) {
   const headers = {
     userId: userId,
     userToken: token,
-    "Content-Type": "appsication/json; charset=utf-8"
+    "Content-Type": "application/json; charset=utf-8"
   }
 
   const baseURL = "https://migu-app-umnb.miguvideo.com/login/token_refresh_migu_plus"
@@ -59,8 +59,13 @@ async function refreshToken(userId, token) {
       // console.log(respResult)
       return true
     }
-    console.dir(respResult, { depth: null })
+    // 响应可能包含 token 等凭据，只输出状态字段
+    console.log("token刷新返回:", respResult?.resultCode, respResult?.rid)
   } catch (error) {
+    // 限流不是刷新失败，必须上抛让本轮更新停止
+    if (error instanceof RateLimitError) {
+      throw error
+    }
   }
 
   return false

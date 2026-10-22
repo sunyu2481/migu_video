@@ -1,10 +1,61 @@
 import { getStringMD5 } from "./EncryUtils.js";
 import { getddCalcuURL, getddCalcuURL720p } from "./ddCalcuURL.js";
 import { printDebug, printGreen, printRed, printYellow } from "./colorOut.js";
-import { fetchUrl } from "./net.js";
+import { fetchUrl, miguFetch, RateLimitError, sanitizeURL } from "./net.js";
 import { enableH265, enableHDR } from "../config.js";
+import { getDeviceId } from "./deviceId.js";
 
-const client_id = getStringMD5(Date.now().toString())
+function delay(ms) {
+  return new Promise(resolve => {
+    setTimeout(resolve, ms)
+  })
+}
+
+// 设备标识，持久化复用，避免每次启动都变成一台新设备
+// 惰性初始化：模块加载时不读写文件，避免仅 import 就产生副作用（测试污染真实 .device_id）
+let clientIdCache = null
+/**
+ * 获取设备标识，首次调用时才读取或生成
+ * @returns {string} - 设备标识
+ */
+function getClientId() {
+  if (clientIdCache == null) {
+    clientIdCache = getDeviceId()
+  }
+  return clientIdCache
+}
+
+/**
+ * 生成响应摘要，避免把播放地址等敏感内容打进日志
+ * @param {any} respData - 接口响应
+ * @returns {object} - 仅包含状态字段的摘要
+ */
+function summarizeResponse(respData) {
+  if (respData == null || typeof respData != "object") {
+    return respData
+  }
+  return {
+    rid: respData.rid,
+    code: respData.code,
+    message: respData.message,
+    rateType: respData.body?.urlInfo?.rateType,
+    logined: respData.body?.auth?.logined,
+  }
+}
+
+/**
+ * 生成请求头摘要，隐藏用户凭据
+ * @param {object} headers - 请求头
+ * @returns {object} - 脱敏后的请求头
+ */
+function sanitizeHeaders(headers) {
+  const hidden = new Set(["userid", "usertoken", "authorization", "cookie", "clientid"])
+  const result = {}
+  for (const [key, value] of Object.entries(headers)) {
+    result[key] = hidden.has(key.toLowerCase()) ? "***" : value
+  }
+  return result
+}
 /**
  * @typedef {object} SaltSign
  * @property {string} salt 盐值
@@ -13,7 +64,7 @@ const client_id = getStringMD5(Date.now().toString())
 
 /**
  * @param {string} md5 - md5字符串
- * @returns {SaltSign} - 
+ * @returns {SaltSign} -
  */
 function getSaltAndSign(md5) {
 
@@ -24,6 +75,25 @@ function getSaltAndSign(md5) {
     salt: salt,
     sign: sign
   }
+}
+
+/**
+ * 为一次请求生成时间戳、签名与查询参数
+ * 每次请求都重新签名，避免复用同一签名被判定为重放
+ * @param {string} pid - 节目ID
+ * @param {number} rateType - 清晰度
+ * @param {string} appVersion - 版本号
+ * @param {string} enableH265Str - h265 参数
+ * @param {string} enableHDRStr - HDR 参数
+ * @returns {string} - 查询字符串
+ */
+function buildPlayParams(pid, rateType, appVersion, enableH265Str, enableHDRStr) {
+  const timestramp = Date.now()
+  const md5 = getStringMD5(timestramp + pid + appVersion)
+  const result = getSaltAndSign(md5)
+  return "?sign=" + result.sign + "&rateType=" + rateType
+    + "&contId=" + pid + "&timestamp=" + timestramp + "&salt=" + result.salt
+    + "&flvEnable=true&super4k=true" + enableH265Str + enableHDRStr
 }
 
 /**
@@ -42,13 +112,12 @@ async function getAndroidURL(userId, token, pid, rateType) {
       content: null
     }
   }
-  // 获取url
-  const timestramp = Date.now()
   const appVersion = "26000370"
   let headers = {
     AppVersion: 2600037000,
     TerminalId: "android",
     "X-UP-CLIENT-CHANNEL-ID": "2600037000-99000-200300220100002",
+    ClientId: getClientId(),
   }
   // cctv5和5+开启flv后不能回放
   if (pid != "641886683" && pid != "641886773") {
@@ -59,58 +128,47 @@ async function getAndroidURL(userId, token, pid, rateType) {
     headers.UserId = userId
     headers.UserToken = token
   }
-  // console.log(headers)
-  const str = timestramp + pid + appVersion
-  const md5 = getStringMD5(str)
-  const result = getSaltAndSign(md5)
-
   let enableHDRStr = ""
-  if (enableHDR != "false") {
+  if (enableHDR) {
     enableHDRStr = "&4kvivid=true&2Kvivid=true&vivid=2"
   }
   let enableH265Str = ""
-  if (enableH265 != "false") {
+  if (enableH265) {
     enableH265Str = "&h265N=true"
   }
   // 请求
   const baseURL = "https://play.miguvideo.com/playurl/v1/play/playurl"
-  let params = "?sign=" + result.sign + "&rateType=" + rateType
-    + "&contId=" + pid + "&timestamp=" + timestramp + "&salt=" + result.salt
-    + "&flvEnable=true&super4k=true" + enableH265Str + enableHDRStr
-  printDebug(`请求链接: ${baseURL + params}`)
+  let params = buildPlayParams(pid, rateType, appVersion, enableH265Str, enableHDRStr)
+  printDebug(`请求链接: ${sanitizeURL(baseURL)}`)
   let respData = await fetchUrl(baseURL + params, {
     headers: headers
   })
 
-  printDebug(respData)
+  printDebug(summarizeResponse(respData))
 
-  if (respData.rid == 'TIPS_NEED_MEMBER') {
+  if (respData?.rid == 'TIPS_NEED_MEMBER') {
     printYellow("该账号没有会员 正在降低画质")
     let respRateType = parseInt(respData.body.urlInfo?.rateType) > 4 ? 4 : 3
-    params = "?sign=" + result.sign + "&rateType=" + respRateType
-      + "&contId=" + pid + "&timestamp=" + timestramp + "&salt=" + result.salt
-      + "&flvEnable=true&super4k=true" + enableH265Str + enableHDRStr
-    printDebug(`请求链接: ${baseURL + params}`)
+    params = buildPlayParams(pid, respRateType, appVersion, enableH265Str, enableHDRStr)
+    printDebug(`请求链接: ${sanitizeURL(baseURL)}`)
     respData = await fetchUrl(baseURL + params, {
       headers: headers
     })
 
-    if (respData.rid == 'TIPS_NEED_MEMBER') {
+    if (respData?.rid == 'TIPS_NEED_MEMBER') {
       printYellow("账号非钻石会员 降低画质")
 
-      params = "?sign=" + result.sign + "&rateType=3"
-        + "&contId=" + pid + "&timestamp=" + timestramp + "&salt=" + result.salt
-        + "&flvEnable=true&super4k=true" + enableH265Str + enableHDRStr
-      printDebug(`请求链接: ${baseURL + params}`)
+      params = buildPlayParams(pid, 3, appVersion, enableH265Str, enableHDRStr)
+      printDebug(`请求链接: ${sanitizeURL(baseURL)}`)
       respData = await fetchUrl(baseURL + params, {
         headers: headers
       })
     }
   }
 
-  printDebug(respData)
+  printDebug(summarizeResponse(respData))
   // console.log(respData)
-  const url = respData.body.urlInfo?.url
+  const url = respData?.body?.urlInfo?.url
   // console.log(rateType)
   // console.log(url)
   if (!url) {
@@ -150,9 +208,8 @@ async function getAndroidURL720p(pid) {
     AppVersion: `${appVersion}`,
     TerminalId: "android",
     "X-UP-CLIENT-CHANNEL-ID": `${appVersionID}`,
-    ClientId: client_id,
+    ClientId: getClientId(),
   }
-  printDebug("client_id: " + client_id)
   // cctv5和5+开启flv后不能回放
   if (pid != "641886683" && pid != "641886773") {
     headers["appCode"] = "miguvideo_default_android"
@@ -167,11 +224,11 @@ async function getAndroidURL720p(pid) {
 
   let rateType = 3
   let enableHDRStr = ""
-  if (enableHDR != "false") {
+  if (enableHDR) {
     enableHDRStr = "&4kvivid=true&2Kvivid=true&vivid=2"
   }
   let enableH265Str = ""
-  if (enableH265 != "false") {
+  if (enableH265) {
     enableH265Str = "&h265N=true"
   }
   // 请求
@@ -179,15 +236,15 @@ async function getAndroidURL720p(pid) {
   const params = "?sign=" + sign + "&rateType=" + rateType
     + "&contId=" + pid + "&timestamp=" + timestramp + "&salt=" + salt
     + "&flvEnable=true&super4k=true" + enableH265Str + enableHDRStr
-  printDebug(`请求链接: ${baseURL + params}`)
-  printDebug(headers)
+  printDebug(`请求链接: ${sanitizeURL(baseURL)}`)
+  printDebug(sanitizeHeaders(headers))
   const respData = await fetchUrl(baseURL + params, {
     headers: headers
   })
 
-  printDebug(respData)
+  printDebug(summarizeResponse(respData))
   // console.dir(respData, { depth: null })
-  const url = respData.body.urlInfo?.url
+  const url = respData?.body?.urlInfo?.url
   // console.log(rateType)
   // console.log(url)
   if (!url) {
@@ -214,8 +271,8 @@ async function getAndroidURL720p(pid) {
 
 async function get302URL(resObj) {
   try {
-    let z = 1
-    while (z <= 6) {
+    const maxRetry = 6
+    for (let z = 1; z <= maxRetry; z++) {
       if (z >= 2) {
         printYellow(`获取失败,正在第${z - 1}次重试`)
       }
@@ -224,28 +281,37 @@ async function get302URL(resObj) {
         controller.abort()
         printRed("请求超时")
       }, 6000);
-      const obj = await fetch(`${resObj.url}`, {
-        method: "GET",
-        redirect: "manual",
-        signal: controller.signal
-      }).catch(err => {
-        clearTimeout(timeoutId);
-        console.log(err)
-      })
-      clearTimeout(timeoutId);
-      const location = obj.headers.get("Location")
-
-      if (location != "" && location != undefined && location != null) {
-        if (!location.startsWith("http://bofang")) {
-          return location
+      let location = null
+      try {
+        const obj = await miguFetch(resObj.url, {
+          method: "GET",
+          redirect: "manual",
+          signal: controller.signal
+        })
+        location = obj.headers.get("Location")
+      } catch (err) {
+        // 限流时直接放弃，不再重试，避免把软限流打成 IP 封禁
+        if (err instanceof RateLimitError) {
+          clearTimeout(timeoutId)
+          throw err
         }
+        console.log(err)
+      } finally {
+        clearTimeout(timeoutId)
       }
-      if (z != 6) {
-        await delay(150)
+
+      if (location && !location.startsWith("http://bofang")) {
+        return location
       }
-      z++
+      if (z != maxRetry) {
+        await delay(300)
+      }
     }
   } catch (error) {
+    // 限流必须继续上抛，否则这里的通用捕获会让上面的重抛失效
+    if (error instanceof RateLimitError) {
+      throw error
+    }
     console.log(error)
   }
   printRed(`获取失败,返回原链接`)

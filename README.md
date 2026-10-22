@@ -29,6 +29,7 @@ https://gh-proxy.com/https://raw.githubusercontent.com/develop202/migu_video/ref
 >
 > 1. 登录会封号！登录会封号！登录会封号！为避免不必要的损失，请谨慎登录使用
 > 1. 需要国内IP才可正常访问（非港澳台地区）
+> 1. 高频请求会封IP。请勿关闭内置限流，也勿在被限流后立即重试（见下方「关于封IP」）
 
 ## 配置
 
@@ -49,6 +50,35 @@ https://gh-proxy.com/https://raw.githubusercontent.com/develop202/migu_video/ref
 | mignoreCategory      | null   | string  | 屏蔽分类，每个分类名用逗号隔开<br>例如: 央视,卫视,体育-昨天,体育-明天<br>TV,体育-明天<br>ps: TV可以屏蔽所有电视，PE可以屏蔽所有体育 |
 | mmergeTVCategory     | true   | boolean | 是否将TV节目数量较少的分类合并到其他分类                                                                                            |
 | mcustomMergeCategory | null   | string  | 自定义合并分类到其他分类，每个分类名用逗号隔开，需先将**变量mmergeTVCategory**设置**false**<br>格式: 熊猫,综艺,新闻                 |
+| mrefreshToken        | false  | boolean | 是否刷新token，刷新token有封号风险，默认关闭                                                                                        |
+| mUserAgent           |        | string  | 请求头 User-Agent，留空则使用 Node 默认值（容易被风控识别），建议填入抓包得到的真实 UA                                              |
+| mAcceptLanguage      | zh-CN… | string  | 请求头 Accept-Language                                                                                                              |
+| mMinRequestInterval  | 400    | number  | 对咪咕域名请求的最小间隔，单位毫秒，用于限流，不建议设为 0                                                                          |
+| mRateLimitThreshold  | 1      | number  | 连续被限流(429/403)多少次后熔断并中止本轮抓取，默认收到第一次限流即收敛，0 表示不熔断                                               |
+| mRateLimitCooldownMs | 600000 | number  | 熔断冷却时长，单位毫秒<br>冷却结束后放行一次试探请求，只有收到成功响应才解除熔断                                         |
+| mTreat403AsRateLimit | true   | boolean | 是否把 403 也视为限流并熔断<br>确认某些 403 属于地区限制/权限不足时可设为 false，只对 429 熔断                                 |
+| mClientId            | 自动   | string  | 设备标识，留空时首次运行自动生成并保存到 `.device_id`，后续复用                                                                     |
+
+## 关于封IP
+
+除账号风控外，服务端还会对来源 IP 做频率限制。程序已内置以下保护：
+
+- 对咪咕域名的请求串行执行，并保持最小间隔（`mMinRequestInterval`）
+- 遇到 429/403 视为限流，**不会重试**，连续达到 `mRateLimitThreshold` 次后中止本轮抓取，保留旧数据不被覆盖
+- 设备标识持久化，避免每次重启都变成一台「新设备」
+- 每次请求单独签名，不复用同一签名重放
+- 在线请求触发限流后冷却（默认 10 分钟），期间直接返回 503；冷却结束后的试探请求会绕过内存缓存，真正访问一次上游
+- 试探采用显式状态机：只有上游返回成功响应才解除熔断；仍被限流则重新计时；5xx 或网络错误保持原冷却时间
+- 熔断期间只允许一个试探请求，其余请求继续快速失败，不会出现多个请求同时穿透
+- 日志与错误信息只输出协议、主机名和路径，不含签名等查询参数（含 debug 日志、播放地址与接口响应摘要）
+- 定时更新同样有冷却恢复：限流后跳过冷却期内的更新，冷却结束自动重试，不会永久停更
+- 上游返回 5xx 时直接放弃，不进入重试
+- 静态接口（`/m3u`、`/interface.txt`、`/txt`、`/playback.xml`）只读本地文件，不受上游熔断影响
+
+如果已经出现被限流，**请停止运行并等待数小时到数天**，期间反复重试只会延长封禁时间。另外，CI（Gitee/GitHub Actions）的出口 IP 为共享地址，被波及概率更高，建议在本地或家宽环境抓取。
+
+> [!note]
+> 限流状态保存在进程内存中，多个实例之间不共享。同一出口 IP 下请只运行一个实例（服务与 `fetchURLByAndroid720p.js` 也不要同时运行），否则实际请求频率会叠加。
 
 ## node
 

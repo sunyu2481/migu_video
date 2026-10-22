@@ -2,6 +2,7 @@ import { get302URL, getAndroidURL, getAndroidURL720p, printLoginInfo } from "./a
 import { readFileSync } from "./fileUtil.js";
 import { host, pass, rateType, token, userId } from "../config.js";
 import { printDebug, printGreen, printGrey, printRed, printYellow } from "./colorOut.js";
+import { RateLimitError, sanitizeURL } from "./net.js";
 
 // url缓存 降低请求频率
 const urlCache = {}
@@ -64,13 +65,24 @@ function interfaceStr(url, headers, urlUserId, urlToken) {
   return result
 }
 
-async function channel(url, urlUserId, urlToken) {
+/**
+ * @param {string} url - 请求路径
+ * @param {string} urlUserId - 用户 ID
+ * @param {string} urlToken - 用户 token
+ * @param {object} options - 可选参数
+ * @param {boolean} options.skipCache - 是否跳过缓存，用于熔断冷却后的真实上游试探
+ * @param {Function} options.fetchPlayURL - 获取播放地址，默认按登录状态选择 720p 或高清接口
+ * @returns {Promise<object>} - 频道结果
+ */
+async function channel(url, urlUserId, urlToken, options = {}) {
 
   let result = {
     code: 200,
     pID: "",
     desc: "服务异常",
-    playURL: ""
+    playURL: "",
+    // 是否来自内存缓存，调用方据此判断本次请求是否真的访问了上游
+    fromCache: false
   }
   // 处理频道ID
   let urlSplit = url.split("/")[1]
@@ -95,29 +107,40 @@ async function channel(url, urlUserId, urlToken) {
 
   printYellow("频道ID " + pid)
 
-  // 是否存在缓存
-  const cache = channelCache(pid, params)
+  // 是否存在缓存；试探请求必须绕过缓存，否则本次并未真正探测上游
+  const cache = options.skipCache
+    ? { haveCache: false, code: 200, playURL: "", cacheDesc: "跳过缓存" }
+    : channelCache(pid, params)
   if (cache.haveCache) {
     result.code = cache.code
     result.playURL = cache.playURL
     result.desc = cache.cacheDesc
+    result.fromCache = true
     return result
   }
 
+  // 未登录请求720p；测试可注入 fetchPlayURL 以构造受控上游
+  const fetchPlayURL = options.fetchPlayURL || (() => {
+    if (rateType >= 3 && (!urlUserId || !urlToken)) {
+      return getAndroidURL720p(pid)
+    }
+    return getAndroidURL(urlUserId, urlToken, pid, rateType)
+  })
+
   let resObj = {}
   try {
-    // 未登录请求720p
-    if (rateType >= 3 && (!urlUserId || !urlToken)) {
-      resObj = await getAndroidURL720p(pid)
-    } else {
-      resObj = await getAndroidURL(urlUserId, urlToken, pid, rateType)
-    }
+    resObj = await fetchPlayURL()
   } catch (error) {
+    // 限流必须上抛，由 app.js 返回 503，避免客户端把它当成可重试的普通错误
+    if (error instanceof RateLimitError) {
+      throw error
+    }
     console.log(error)
     result.desc = "链接请求出错"
     return result
   }
-  printDebug(`添加加密字段后链接 ${resObj.url}`)
+  // 播放地址含 ddCalcu 签名，日志只保留协议、主机和路径
+  printDebug(`添加加密字段后链接 ${sanitizeURL(resObj.url)}`)
 
 
   // 可以正确跳转了 不需要再手动过滤了
@@ -145,7 +168,8 @@ async function channel(url, urlUserId, urlToken) {
   }
 
   if (resObj.url == "") {
-    let msg = resObj.content != null ? resObj.content.message : "节目调整，暂不提供服务"
+    // 上游限流或请求失败时 content 可能为 null，此处兼容
+    let msg = resObj.content?.message ?? "节目调整，暂不提供服务"
     result.desc = `${pid} ${msg}`
     return result
   }
