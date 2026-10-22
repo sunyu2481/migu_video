@@ -1,7 +1,7 @@
 import { customMergeCategory, mergeTVCategory } from "../config.js"
 import { fetchUrl } from "./net.js"
 
-const isMergeEnabled = mergeTVCategory !== false && mergeTVCategory !== "false";
+const isMergeEnabled = mergeTVCategory;
 
 function delay(ms) {
   return new Promise(resolve => {
